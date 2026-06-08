@@ -30,18 +30,18 @@ TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 LANGUAGE_PREF_1 = os.getenv("LANGUAGE_PREF_1", "telugu").lower()
 LANGUAGE_PREF_2 = os.getenv("LANGUAGE_PREF_2", "english").lower()
 
-print(f"\n🎬 Nuvio Trailer Proxy v3.0 - TRAILER ONLY MODE")
+print(f"\n🎬 Nuvio Trailer Proxy v3.1 - FULL OVERRIDE MODE")
 print(f"   Language Preference 1: {LANGUAGE_PREF_1}")
 print(f"   Language Preference 2: {LANGUAGE_PREF_2}\n")
 
 @app.get("/manifest.json")
 async def get_manifest():
-    """Manifest for Stremio integration"""
+    """Manifest for Stremio integration - PRIORITIZED to override aiometadata"""
     return {
-        "id": "com.nuvio.trailers.accurate",
-        "version": "3.0.0",
-        "name": "Nuvio Accurate Trailers",
-        "description": "TRAILER-ONLY addon. Swaps trailers only with 100% accurate language preference matching. Works with aiometadata.",
+        "id": "com.nuvio.trailers.override",
+        "version": "3.1.0",
+        "name": "Nuvio Accurate Trailers (Override)",
+        "description": "OVERRIDES aiometadata trailers with 100% accurate language preferences. Returns FULL metadata + correct trailer.",
         "resources": ["meta"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
@@ -53,7 +53,7 @@ def get_language_keywords(language: str) -> list:
     keywords = {
         "telugu": ["telugu", "తెలుగు"],
         "english": ["english"],
-        "hindi": ["hindi", "हिंदी"],
+        "hindi": ["hindi", "हిंदी"],
         "tamil": ["tamil", "தமிழ்"],
         "kannada": ["kannada", "ಕನ್ನಡ"],
         "malayalam": ["malayalam", "മലയാളം"],
@@ -82,7 +82,6 @@ def is_wrong_trailer(title: str, movie_name: str) -> bool:
     
     # Check if movie name appears in title
     movie_words = [w for w in movie_lower.split() if len(w) > 2]
-    title_words = title_lower.split()
     
     # At least one significant word must match
     has_movie_match = any(word in title_lower for word in movie_words)
@@ -275,17 +274,17 @@ async def find_best_trailer(
     return None
 
 @app.get("/meta/{content_type}/{content_id}.json")
-async def get_trailer_only_meta(
+async def get_trailer_override_meta(
     content_type: str,
     content_id: str,
     lang1: str = Query(None),
     lang2: str = Query(None)
 ):
     """
-    TRAILER-ONLY ADDON
+    FULL OVERRIDE ADDON
     
-    Returns ONLY trailer in 'trailers' and 'trailer' fields.
-    Other fields (name, description, etc) remain EMPTY so aiometadata fills them.
+    Returns COMPLETE metadata from TMDB + our accurate trailer.
+    This overrides aiometadata's trailer with our language-preference version.
     
     Language preference order:
     1. lang1 parameter (or LANGUAGE_PREF_1 env var)
@@ -294,6 +293,7 @@ async def get_trailer_only_meta(
     
     Example:
     /meta/movie/tt0111161.json?lang1=telugu&lang2=english
+    /meta/series/tt10940906.json?lang1=telugu&lang2=english
     """
     
     # Use provided languages or defaults
@@ -313,7 +313,8 @@ async def get_trailer_only_meta(
     logger.info(f"Languages: {pref_lang1} > {pref_lang2}")
     logger.info(f"{'='*60}")
     
-    # Get TMDB data to extract movie/series name and year
+    # Get TMDB data to extract movie/series metadata
+    movie_data = {}
     try:
         async with httpx.AsyncClient() as client:
             tmdb_resp = await client.get(
@@ -327,24 +328,51 @@ async def get_trailer_only_meta(
     movie_name = ""
     year = ""
     
-    # Extract movie/series name and year
+    # Extract movie/series data from TMDB
     if isinstance(tmdb_data, dict):
         if content_type == "movie":
             results = tmdb_data.get('movie_results', [])
             if results:
-                movie_name = results[0].get('title', '')
-                year = results[0].get('release_date', '')[:4]
+                item = results[0]
+                movie_data = {
+                    "id": content_id,
+                    "type": content_type,
+                    "name": item.get('title', ''),
+                    "description": item.get('overview', ''),
+                    "releaseInfo": item.get('release_date', '')[:4],
+                }
+                if item.get('poster_path'):
+                    movie_data["poster"] = f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}"
+                if item.get('backdrop_path'):
+                    movie_data["background"] = f"https://image.tmdb.org/t/p/original{item.get('backdrop_path')}"
+                
+                movie_name = item.get('title', '')
+                year = item.get('release_date', '')[:4]
+        
         elif content_type == "series":
             results = tmdb_data.get('tv_results', [])
             if results:
-                movie_name = results[0].get('name', '')
-                year = results[0].get('first_air_date', '')[:4]
+                item = results[0]
+                movie_data = {
+                    "id": content_id,
+                    "type": content_type,
+                    "name": item.get('name', ''),
+                    "description": item.get('overview', ''),
+                    "releaseInfo": item.get('first_air_date', '')[:4],
+                }
+                if item.get('poster_path'):
+                    movie_data["poster"] = f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}"
+                if item.get('backdrop_path'):
+                    movie_data["background"] = f"https://image.tmdb.org/t/p/original{item.get('backdrop_path')}"
+                
+                movie_name = item.get('name', '')
+                year = item.get('first_air_date', '')[:4]
     
     if not movie_name:
         logger.warning(f"Could not find {content_id} in TMDB")
         return {"meta": {"id": content_id, "type": content_type}}
     
-    # Find best trailer
+    # Find best trailer with language preferences
     trailer_result = await find_best_trailer(
         movie_name,
         year,
@@ -353,19 +381,15 @@ async def get_trailer_only_meta(
         content_type
     )
     
-    # Build response - ONLY trailer fields, let aiometadata fill rest
-    meta_data = {
-        "id": content_id,
-        "type": content_type,
-    }
-    
+    # Build COMPLETE response - override trailer but keep all metadata
     if trailer_result:
         video_id = trailer_result['id']
         used_lang = trailer_result['language']
         logger.info(f"\n✅ FINAL: {used_lang.upper()} trailer for {movie_name}")
         
-        meta_data['trailer'] = video_id
-        meta_data['trailers'] = [
+        # Override with our accurate trailer
+        movie_data['trailer'] = video_id
+        movie_data['trailers'] = [
             {
                 "source": video_id,
                 "type": "Trailer"
@@ -373,9 +397,9 @@ async def get_trailer_only_meta(
         ]
     else:
         logger.warning(f"\n⚠️ No trailer available for {movie_name}")
-        # Don't set trailer fields - let aiometadata use its own
+        # Don't set trailer fields - let Stremio use aiometadata's
     
-    meta_response = {"meta": meta_data}
+    meta_response = {"meta": movie_data}
     
     # Cache result
     trailer_cache[cache_key] = meta_response
@@ -389,9 +413,9 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "version": "3.0.0",
-        "mode": "TRAILER-ONLY",
+        "version": "3.1.0",
+        "mode": "FULL OVERRIDE",
         "pref_1": LANGUAGE_PREF_1,
         "pref_2": LANGUAGE_PREF_2,
-        "description": "Returns ONLY trailer data. Metadata comes from aiometadata addon."
+        "description": "Returns FULL metadata from TMDB + override trailer with language preferences. Takes priority over aiometadata."
     }
