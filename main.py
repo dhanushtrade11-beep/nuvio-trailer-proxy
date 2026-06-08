@@ -30,18 +30,18 @@ TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 LANGUAGE_PREF_1 = os.getenv("LANGUAGE_PREF_1", "telugu").lower()
 LANGUAGE_PREF_2 = os.getenv("LANGUAGE_PREF_2", "english").lower()
 
-print(f"\n🎬 Nuvio Trailer Proxy v3.1 - FULL OVERRIDE MODE")
+print(f"\n🎬 Nuvio Trailer Proxy v3.2 - TRAILER SWAP ONLY")
 print(f"   Language Preference 1: {LANGUAGE_PREF_1}")
 print(f"   Language Preference 2: {LANGUAGE_PREF_2}\n")
 
 @app.get("/manifest.json")
 async def get_manifest():
-    """Manifest for Stremio integration - PRIORITIZED to override aiometadata"""
+    """Manifest for Stremio integration"""
     return {
-        "id": "com.nuvio.trailers.override",
-        "version": "3.1.0",
-        "name": "Nuvio Accurate Trailers (Override)",
-        "description": "OVERRIDES aiometadata trailers with 100% accurate language preferences. Returns FULL metadata + correct trailer.",
+        "id": "com.nuvio.trailers.swap",
+        "version": "3.2.0",
+        "name": "Nuvio Accurate Trailers (Swap Only)",
+        "description": "SWAPS TRAILER ONLY with accurate language preference. Preserves all aiometadata metadata. Returns empty metadata so aiometadata fills everything except trailer.",
         "resources": ["meta"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
@@ -53,8 +53,8 @@ def get_language_keywords(language: str) -> list:
     keywords = {
         "telugu": ["telugu", "తెలుగు"],
         "english": ["english"],
-        "hindi": ["hindi", "हిंदी"],
-        "tamil": ["tamil", "தமிழ்"],
+        "hindi": ["hindi", "हिंदी"],
+        "tamil": ["tamil", "தమிழ்"],
         "kannada": ["kannada", "ಕನ್ನಡ"],
         "malayalam": ["malayalam", "മലയാളം"],
     }
@@ -65,88 +65,59 @@ def string_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
 def is_wrong_trailer(title: str, movie_name: str) -> bool:
-    """
-    Detect if trailer is DEFINITELY wrong by checking:
-    1. Known wrong movies (hard blocklist)
-    2. Zero similarity to actual movie name
-    """
+    """Check if trailer is definitely wrong"""
     title_lower = title.lower()
     movie_lower = movie_name.lower()
     
-    # Hard blocklist - NEVER these trailers
+    # Hard blocklist
     hard_blocklist = ["chihni", "arjun reddy", "ye raat", "kabali"]
     
     if any(blocked in title_lower for blocked in hard_blocklist):
-        logger.info(f"   ⛔ BLOCKED (hard list): {title}")
         return True
     
     # Check if movie name appears in title
     movie_words = [w for w in movie_lower.split() if len(w) > 2]
-    
-    # At least one significant word must match
     has_movie_match = any(word in title_lower for word in movie_words)
     
     if not has_movie_match:
         similarity = string_similarity(title, movie_name)
-        # Reject if less than 40% similar AND doesn't contain movie words
         if similarity < 0.4:
-            logger.info(f"   ⛔ LOW MATCH ({similarity:.0%}): {title}")
             return True
     
     return False
 
 def is_valid_language_trailer(title: str, language: str) -> bool:
-    """Check if trailer title contains language keyword"""
+    """Check if trailer has language keyword"""
     keywords = get_language_keywords(language)
     title_lower = title.lower()
-    
-    # Must contain the language keyword
     has_language = any(kw in title_lower for kw in keywords)
-    
-    if not has_language:
-        logger.info(f"   ❌ No '{language}' keyword: {title}")
-        return False
-    
-    return True
+    return has_language
 
 async def search_trailer_exact_language(
     movie_name: str,
     year: str,
     language: str,
     content_type: str = "movie"
-) -> dict:
-    """
-    Search for trailer in EXACT language preference.
-    Only returns trailers with that specific language keyword.
-    """
-    logger.info(f"\n   🔍 Searching {language.upper()} trailer...")
+) -> str:
+    """Search for trailer in exact language. Returns video ID or None."""
     
     try:
-        # Build search query
         search_query = f"{movie_name} {year} official {language} trailer"
         if content_type == "series":
             search_query += " series"
-        
-        logger.info(f"      Query: {search_query}")
         
         search = VideosSearch(search_query, limit=20)
         results = await search.next()
         
         if not results or not results.get('result'):
-            logger.info(f"   ⚠️  No {language} trailers found")
             return None
         
-        logger.info(f"      Found {len(results['result'])} results")
-        
-        for idx, video in enumerate(results['result'], 1):
+        for video in results['result']:
             title = video.get('title', '')
             video_id = video.get('id', '')
             
-            logger.info(f"      Result {idx}: {title}")
-            
             # MUST contain "trailer"
             if "trailer" not in title.lower():
-                logger.info(f"         ❌ Not a trailer")
                 continue
             
             # Check if wrong trailer
@@ -158,57 +129,38 @@ async def search_trailer_exact_language(
                 continue
             
             # Valid trailer found!
-            similarity = string_similarity(title, movie_name)
-            logger.info(f"         ✅ VALID {language.upper()}: similarity {similarity:.0%}")
-            return {
-                "id": video_id,
-                "language": language,
-                "title": title
-            }
+            return video_id
         
-        logger.info(f"   ⚠️  No valid {language} trailer found in results")
         return None
     
     except Exception as e:
-        logger.error(f"   ❌ Error: {str(e)}")
+        logger.error(f"Error searching {language}: {str(e)}")
         return None
 
 async def search_trailer_generic(
     movie_name: str,
     year: str,
     content_type: str = "movie"
-) -> dict:
-    """
-    Final fallback: Search generic trailer (any language).
-    Used when both preferences unavailable.
-    """
-    logger.info(f"\n   🎬 Fallback: Searching generic trailer...")
+) -> str:
+    """Generic trailer search. Returns video ID or None."""
     
     try:
         search_query = f"{movie_name} {year} official trailer"
         if content_type == "series":
             search_query += " series"
         
-        logger.info(f"      Query: {search_query}")
-        
         search = VideosSearch(search_query, limit=20)
         results = await search.next()
         
         if not results or not results.get('result'):
-            logger.info(f"   ⚠️  No generic trailers found")
             return None
         
-        logger.info(f"      Found {len(results['result'])} results")
-        
-        for idx, video in enumerate(results['result'], 1):
+        for video in results['result']:
             title = video.get('title', '')
             video_id = video.get('id', '')
             
-            logger.info(f"      Result {idx}: {title}")
-            
             # MUST contain "trailer"
             if "trailer" not in title.lower():
-                logger.info(f"         ❌ Not a trailer")
                 continue
             
             # Check if wrong trailer
@@ -216,87 +168,78 @@ async def search_trailer_generic(
                 continue
             
             # Valid trailer found!
-            similarity = string_similarity(title, movie_name)
-            logger.info(f"         ✅ VALID: similarity {similarity:.0%}")
-            return {
-                "id": video_id,
-                "language": "original",
-                "title": title
-            }
+            return video_id
         
-        logger.info(f"   ⚠️  No valid generic trailer found")
         return None
     
     except Exception as e:
-        logger.error(f"   ❌ Error: {str(e)}")
+        logger.error(f"Error generic search: {str(e)}")
         return None
 
-async def find_best_trailer(
+async def get_accurate_trailer(
     movie_name: str,
     year: str,
     lang1: str,
     lang2: str,
     content_type: str = "movie"
-) -> dict:
+) -> str:
     """
-    Find BEST trailer following language preference order:
-    1. Try LANGUAGE PREF 1
-    2. If not found → Try LANGUAGE PREF 2
-    3. If not found → Try ORIGINAL
+    Get accurate trailer ID following language preferences.
+    Returns video ID or None.
     
-    INSTANTLY returns first available.
+    Logic:
+    1. Try language 1
+    2. Try language 2
+    3. Try generic
+    Returns None if no trailer found (aiometadata will provide its own)
     """
-    logger.info(f"\n🎯 Trailer Search for: {movie_name} ({year}) - {content_type}")
-    logger.info(f"   Preferences: {lang1} → {lang2} → Original")
     
-    # PASS 1: First preference language
-    logger.info(f"\n[PASS 1] Language: {lang1}")
-    result = await search_trailer_exact_language(movie_name, year, lang1, content_type)
-    if result:
-        logger.info(f"✅ FOUND {lang1} trailer: {result['title']}")
-        return result
+    logger.info(f"🎯 Finding trailer: {movie_name} ({year})")
     
-    # PASS 2: Second preference language
-    logger.info(f"\n[PASS 2] Language: {lang2}")
-    result = await search_trailer_exact_language(movie_name, year, lang2, content_type)
-    if result:
-        logger.info(f"✅ FOUND {lang2} trailer: {result['title']}")
-        return result
+    # PASS 1: First preference
+    logger.info(f"   [PASS 1] Searching {lang1}...")
+    video_id = await search_trailer_exact_language(movie_name, year, lang1, content_type)
+    if video_id:
+        logger.info(f"   ✅ Found {lang1} trailer: {video_id}")
+        return video_id
     
-    # PASS 3: Original language
-    logger.info(f"\n[PASS 3] Language: ORIGINAL")
-    result = await search_trailer_generic(movie_name, year, content_type)
-    if result:
-        logger.info(f"✅ FOUND original trailer: {result['title']}")
-        return result
+    # PASS 2: Second preference
+    logger.info(f"   [PASS 2] Searching {lang2}...")
+    video_id = await search_trailer_exact_language(movie_name, year, lang2, content_type)
+    if video_id:
+        logger.info(f"   ✅ Found {lang2} trailer: {video_id}")
+        return video_id
     
-    logger.warning(f"❌ NO TRAILER FOUND for {movie_name}")
+    # PASS 3: Generic
+    logger.info(f"   [PASS 3] Searching original language...")
+    video_id = await search_trailer_generic(movie_name, year, content_type)
+    if video_id:
+        logger.info(f"   ✅ Found original trailer: {video_id}")
+        return video_id
+    
+    logger.info(f"   ⚠️  No trailer found (aiometadata will provide)")
     return None
 
 @app.get("/meta/{content_type}/{content_id}.json")
-async def get_trailer_override_meta(
+async def swap_trailer_only(
     content_type: str,
     content_id: str,
     lang1: str = Query(None),
     lang2: str = Query(None)
 ):
     """
-    FULL OVERRIDE ADDON
+    TRAILER SWAP ONLY
     
-    Returns COMPLETE metadata from TMDB + our accurate trailer.
-    This overrides aiometadata's trailer with our language-preference version.
+    Returns MINIMAL metadata (only id, type, trailer).
+    Lets aiometadata provide all other fields (name, description, poster, etc).
     
-    Language preference order:
-    1. lang1 parameter (or LANGUAGE_PREF_1 env var)
-    2. lang2 parameter (or LANGUAGE_PREF_2 env var)
-    3. Original language (any available)
+    This way:
+    - aiometadata's metadata is preserved
+    - Only the trailer is swapped with accurate version
     
-    Example:
-    /meta/movie/tt0111161.json?lang1=telugu&lang2=english
-    /meta/series/tt10940906.json?lang1=telugu&lang2=english
+    Language preference: lang1 > lang2 > original
     """
     
-    # Use provided languages or defaults
     pref_lang1 = (lang1 or LANGUAGE_PREF_1).lower()
     pref_lang2 = (lang2 or LANGUAGE_PREF_2).lower()
     
@@ -304,48 +247,36 @@ async def get_trailer_override_meta(
     
     # Check cache
     if cache_key in trailer_cache:
-        cached = trailer_cache[cache_key]
-        logger.info(f"⚡ Cache HIT for {content_id}")
-        return cached
+        logger.info(f"⚡ Cache HIT: {content_id}")
+        return trailer_cache[cache_key]
     
-    logger.info(f"\n{'='*60}")
-    logger.info(f"Request: {content_type}/{content_id}")
+    logger.info(f"\n{'='*50}")
+    logger.info(f"ID: {content_id} | Type: {content_type}")
     logger.info(f"Languages: {pref_lang1} > {pref_lang2}")
-    logger.info(f"{'='*60}")
+    logger.info(f"{'='*50}")
     
-    # Get TMDB data to extract movie/series metadata
-    movie_data = {}
-    try:
-        async with httpx.AsyncClient() as client:
-            tmdb_resp = await client.get(
-                f"https://api.themoviedb.org/3/find/{content_id}?api_key={TMDB_API_KEY}&external_source=imdb_id"
-            )
-            tmdb_data = tmdb_resp.json()
-    except Exception as e:
-        logger.error(f"TMDB API error: {e}")
-        return {"meta": {"id": content_id, "type": content_type}}
-    
+    # Get movie name and year from TMDB
     movie_name = ""
     year = ""
     
-    # Extract movie/series data from TMDB
+    try:
+        async with httpx.AsyncClient() as client:
+            tmdb_resp = await client.get(
+                f"https://api.themoviedb.org/3/find/{content_id}?api_key={TMDB_API_KEY}&external_source=imdb_id",
+                timeout=10
+            )
+            tmdb_data = tmdb_resp.json()
+    except Exception as e:
+        logger.error(f"TMDB error: {e}")
+        # Return empty - aiometadata will fill
+        return {"meta": {"id": content_id, "type": content_type}}
+    
+    # Extract name and year
     if isinstance(tmdb_data, dict):
         if content_type == "movie":
             results = tmdb_data.get('movie_results', [])
             if results:
                 item = results[0]
-                movie_data = {
-                    "id": content_id,
-                    "type": content_type,
-                    "name": item.get('title', ''),
-                    "description": item.get('overview', ''),
-                    "releaseInfo": item.get('release_date', '')[:4],
-                }
-                if item.get('poster_path'):
-                    movie_data["poster"] = f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}"
-                if item.get('backdrop_path'):
-                    movie_data["background"] = f"https://image.tmdb.org/t/p/original{item.get('backdrop_path')}"
-                
                 movie_name = item.get('title', '')
                 year = item.get('release_date', '')[:4]
         
@@ -353,27 +284,18 @@ async def get_trailer_override_meta(
             results = tmdb_data.get('tv_results', [])
             if results:
                 item = results[0]
-                movie_data = {
-                    "id": content_id,
-                    "type": content_type,
-                    "name": item.get('name', ''),
-                    "description": item.get('overview', ''),
-                    "releaseInfo": item.get('first_air_date', '')[:4],
-                }
-                if item.get('poster_path'):
-                    movie_data["poster"] = f"https://image.tmdb.org/t/p/w500{item.get('poster_path')}"
-                if item.get('backdrop_path'):
-                    movie_data["background"] = f"https://image.tmdb.org/t/p/original{item.get('backdrop_path')}"
-                
                 movie_name = item.get('name', '')
                 year = item.get('first_air_date', '')[:4]
     
     if not movie_name:
-        logger.warning(f"Could not find {content_id} in TMDB")
-        return {"meta": {"id": content_id, "type": content_type}}
+        logger.warning(f"Not found in TMDB")
+        # Return empty - aiometadata will fill
+        response = {"meta": {"id": content_id, "type": content_type}}
+        trailer_cache[cache_key] = response
+        return response
     
-    # Find best trailer with language preferences
-    trailer_result = await find_best_trailer(
+    # Get accurate trailer
+    video_id = await get_accurate_trailer(
         movie_name,
         year,
         pref_lang1,
@@ -381,41 +303,38 @@ async def get_trailer_override_meta(
         content_type
     )
     
-    # Build COMPLETE response - override trailer but keep all metadata
-    if trailer_result:
-        video_id = trailer_result['id']
-        used_lang = trailer_result['language']
-        logger.info(f"\n✅ FINAL: {used_lang.upper()} trailer for {movie_name}")
-        
-        # Override with our accurate trailer
-        movie_data['trailer'] = video_id
-        movie_data['trailers'] = [
-            {
-                "source": video_id,
-                "type": "Trailer"
-            }
-        ]
+    # Return MINIMAL response - ONLY id, type, trailer
+    # aiometadata will fill name, description, poster, background
+    meta_response = {
+        "meta": {
+            "id": content_id,
+            "type": content_type,
+        }
+    }
+    
+    # ONLY add trailer if we found one
+    if video_id:
+        logger.info(f"✅ Swapping trailer: {video_id}")
+        meta_response["meta"]["trailer"] = video_id
+        meta_response["meta"]["trailers"] = [{"source": video_id, "type": "Trailer"}]
     else:
-        logger.warning(f"\n⚠️ No trailer available for {movie_name}")
-        # Don't set trailer fields - let Stremio use aiometadata's
+        logger.info(f"⚠️ Returning empty trailer field (aiometadata will provide)")
+        # Don't set trailer fields - aiometadata will fill them
     
-    meta_response = {"meta": movie_data}
-    
-    # Cache result
+    # Cache
     trailer_cache[cache_key] = meta_response
     
-    logger.info(f"{'='*60}\n")
+    logger.info(f"{'='*50}\n")
     
     return meta_response
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {
         "status": "healthy",
-        "version": "3.1.0",
-        "mode": "FULL OVERRIDE",
+        "version": "3.2.0",
+        "mode": "TRAILER SWAP ONLY",
         "pref_1": LANGUAGE_PREF_1,
         "pref_2": LANGUAGE_PREF_2,
-        "description": "Returns FULL metadata from TMDB + override trailer with language preferences. Takes priority over aiometadata."
+        "note": "Returns minimal response. aiometadata provides metadata, this addon swaps trailer only."
     }
