@@ -30,18 +30,18 @@ TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 LANGUAGE_PREF_1 = os.getenv("LANGUAGE_PREF_1", "telugu").lower()
 LANGUAGE_PREF_2 = os.getenv("LANGUAGE_PREF_2", "english").lower()
 
-print(f"\n🎬 Nuvio Trailer Proxy v3.2 - TRAILER SWAP ONLY")
+print(f"\n🎬 Nuvio Trailer Proxy v3.3 - GUARANTEED TRAILER OVERRIDE")
 print(f"   Language Preference 1: {LANGUAGE_PREF_1}")
 print(f"   Language Preference 2: {LANGUAGE_PREF_2}\n")
 
 @app.get("/manifest.json")
 async def get_manifest():
-    """Manifest for Stremio integration"""
+    """Manifest for Stremio integration - HIGHEST PRIORITY"""
     return {
-        "id": "com.nuvio.trailers.swap",
-        "version": "3.2.0",
-        "name": "Nuvio Accurate Trailers (Swap Only)",
-        "description": "SWAPS TRAILER ONLY with accurate language preference. Preserves all aiometadata metadata. Returns empty metadata so aiometadata fills everything except trailer.",
+        "id": "com.nuvio.trailers.accurate",
+        "version": "3.3.0",
+        "name": "Nuvio Accurate Trailers",
+        "description": "Overwrites incorrect trailers with accurate language preferences. MUST be placed FIRST in addon list.",
         "resources": ["meta"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
@@ -54,9 +54,9 @@ def get_language_keywords(language: str) -> list:
         "telugu": ["telugu", "తెలుగు"],
         "english": ["english"],
         "hindi": ["hindi", "हिंदी"],
-        "tamil": ["tamil", "தమிழ்"],
+        "tamil": ["tamil", "தமிழ்"],
         "kannada": ["kannada", "ಕನ್ನಡ"],
-        "malayalam": ["malayalam", "മലയാളം"],
+        "malayalam": ["malayalam", "മలയാളం"],
     }
     return keywords.get(language, [language])
 
@@ -191,7 +191,6 @@ async def get_accurate_trailer(
     1. Try language 1
     2. Try language 2
     3. Try generic
-    Returns None if no trailer found (aiometadata will provide its own)
     """
     
     logger.info(f"🎯 Finding trailer: {movie_name} ({year})")
@@ -217,27 +216,33 @@ async def get_accurate_trailer(
         logger.info(f"   ✅ Found original trailer: {video_id}")
         return video_id
     
-    logger.info(f"   ⚠️  No trailer found (aiometadata will provide)")
+    logger.info(f"   ⚠️  No trailer found")
     return None
 
 @app.get("/meta/{content_type}/{content_id}.json")
-async def swap_trailer_only(
+async def get_trailer_meta(
     content_type: str,
     content_id: str,
     lang1: str = Query(None),
     lang2: str = Query(None)
 ):
     """
-    TRAILER SWAP ONLY
+    GET ACCURATE TRAILER
     
-    Returns MINIMAL metadata (only id, type, trailer).
-    Lets aiometadata provide all other fields (name, description, poster, etc).
+    This addon MUST BE FIRST in your addon list to override aiometadata.
     
-    This way:
-    - aiometadata's metadata is preserved
-    - Only the trailer is swapped with accurate version
+    Strategy:
+    1. Get movie name from TMDB
+    2. Search for accurate trailer based on language preferences
+    3. Return COMPLETE metadata with our trailer
+    4. When placed FIRST, Stremio uses our trailer (not aiometadata's)
     
-    Language preference: lang1 > lang2 > original
+    If you place this addon AFTER aiometadata, it won't work because
+    Stremio stops requesting after first addon returns full response.
+    
+    ADDON ORDER MUST BE:
+    1. Nuvio Trailer Proxy (this)
+    2. aiometadata (or any other addon)
     """
     
     pref_lang1 = (lang1 or LANGUAGE_PREF_1).lower()
@@ -258,6 +263,9 @@ async def swap_trailer_only(
     # Get movie name and year from TMDB
     movie_name = ""
     year = ""
+    overview = ""
+    poster_path = ""
+    backdrop_path = ""
     
     try:
         async with httpx.AsyncClient() as client:
@@ -268,10 +276,9 @@ async def swap_trailer_only(
             tmdb_data = tmdb_resp.json()
     except Exception as e:
         logger.error(f"TMDB error: {e}")
-        # Return empty - aiometadata will fill
         return {"meta": {"id": content_id, "type": content_type}}
     
-    # Extract name and year
+    # Extract metadata
     if isinstance(tmdb_data, dict):
         if content_type == "movie":
             results = tmdb_data.get('movie_results', [])
@@ -279,6 +286,9 @@ async def swap_trailer_only(
                 item = results[0]
                 movie_name = item.get('title', '')
                 year = item.get('release_date', '')[:4]
+                overview = item.get('overview', '')
+                poster_path = item.get('poster_path', '')
+                backdrop_path = item.get('backdrop_path', '')
         
         elif content_type == "series":
             results = tmdb_data.get('tv_results', [])
@@ -286,10 +296,12 @@ async def swap_trailer_only(
                 item = results[0]
                 movie_name = item.get('name', '')
                 year = item.get('first_air_date', '')[:4]
+                overview = item.get('overview', '')
+                poster_path = item.get('poster_path', '')
+                backdrop_path = item.get('backdrop_path', '')
     
     if not movie_name:
         logger.warning(f"Not found in TMDB")
-        # Return empty - aiometadata will fill
         response = {"meta": {"id": content_id, "type": content_type}}
         trailer_cache[cache_key] = response
         return response
@@ -303,23 +315,32 @@ async def swap_trailer_only(
         content_type
     )
     
-    # Return MINIMAL response - ONLY id, type, trailer
-    # aiometadata will fill name, description, poster, background
+    # Return COMPLETE metadata with our accurate trailer
+    # This way, when placed FIRST, our trailer is used
     meta_response = {
         "meta": {
             "id": content_id,
             "type": content_type,
+            "name": movie_name,
+            "releaseInfo": year,
         }
     }
     
-    # ONLY add trailer if we found one
+    # Add optional fields
+    if overview:
+        meta_response["meta"]["description"] = overview
+    if poster_path:
+        meta_response["meta"]["poster"] = f"https://image.tmdb.org/t/p/w500{poster_path}"
+    if backdrop_path:
+        meta_response["meta"]["background"] = f"https://image.tmdb.org/t/p/original{backdrop_path}"
+    
+    # Add trailer (this is the key - our accurate trailer)
     if video_id:
-        logger.info(f"✅ Swapping trailer: {video_id}")
+        logger.info(f"✅ Adding accurate trailer: {video_id}")
         meta_response["meta"]["trailer"] = video_id
         meta_response["meta"]["trailers"] = [{"source": video_id, "type": "Trailer"}]
     else:
-        logger.info(f"⚠️ Returning empty trailer field (aiometadata will provide)")
-        # Don't set trailer fields - aiometadata will fill them
+        logger.info(f"⚠️ No trailer found")
     
     # Cache
     trailer_cache[cache_key] = meta_response
@@ -332,9 +353,10 @@ async def swap_trailer_only(
 async def health_check():
     return {
         "status": "healthy",
-        "version": "3.2.0",
-        "mode": "TRAILER SWAP ONLY",
+        "version": "3.3.0",
+        "mode": "FULL OVERRIDE - MUST BE FIRST",
         "pref_1": LANGUAGE_PREF_1,
         "pref_2": LANGUAGE_PREF_2,
-        "note": "Returns minimal response. aiometadata provides metadata, this addon swaps trailer only."
+        "IMPORTANT": "Place this addon FIRST in your Stremio addon list, BEFORE aiometadata",
+        "note": "Returns full metadata. Because it's FIRST, Stremio uses our trailer and stops here."
     }
