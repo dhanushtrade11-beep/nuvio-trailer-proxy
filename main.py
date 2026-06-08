@@ -30,18 +30,18 @@ TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 LANGUAGE_PREF_1 = os.getenv("LANGUAGE_PREF_1", "telugu").lower()
 LANGUAGE_PREF_2 = os.getenv("LANGUAGE_PREF_2", "english").lower()
 
-print(f"\n🎬 Nuvio Trailer Proxy v3.3 - GUARANTEED TRAILER OVERRIDE")
+print(f"\n🎬 Nuvio Trailer Proxy v3.4 - COMPLETE METADATA + ACCURATE TRAILER")
 print(f"   Language Preference 1: {LANGUAGE_PREF_1}")
 print(f"   Language Preference 2: {LANGUAGE_PREF_2}\n")
 
 @app.get("/manifest.json")
 async def get_manifest():
-    """Manifest for Stremio integration - HIGHEST PRIORITY"""
+    """Manifest for Stremio integration"""
     return {
-        "id": "com.nuvio.trailers.accurate",
-        "version": "3.3.0",
-        "name": "Nuvio Accurate Trailers",
-        "description": "Overwrites incorrect trailers with accurate language preferences. MUST be placed FIRST in addon list.",
+        "id": "com.nuvio.trailers.complete",
+        "version": "3.4.0",
+        "name": "Nuvio Accurate Trailers (Complete)",
+        "description": "Returns FULL metadata (cast, director, rating, genres, etc) + accurate trailer. Override aiometadata.",
         "resources": ["meta"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"],
@@ -53,10 +53,10 @@ def get_language_keywords(language: str) -> list:
     keywords = {
         "telugu": ["telugu", "తెలుగు"],
         "english": ["english"],
-        "hindi": ["hindi", "हिंदी"],
-        "tamil": ["tamil", "தமிழ்"],
+        "hindi": ["hindi", "हిंदी"],
+        "tamil": ["tamil", "தమిழ்"],
         "kannada": ["kannada", "ಕನ್ನಡ"],
-        "malayalam": ["malayalam", "മలയാളం"],
+        "malayalam": ["malayalam", "മലയാളം"],
     }
     return keywords.get(language, [language])
 
@@ -183,15 +183,7 @@ async def get_accurate_trailer(
     lang2: str,
     content_type: str = "movie"
 ) -> str:
-    """
-    Get accurate trailer ID following language preferences.
-    Returns video ID or None.
-    
-    Logic:
-    1. Try language 1
-    2. Try language 2
-    3. Try generic
-    """
+    """Get accurate trailer ID following language preferences."""
     
     logger.info(f"🎯 Finding trailer: {movie_name} ({year})")
     
@@ -219,30 +211,104 @@ async def get_accurate_trailer(
     logger.info(f"   ⚠️  No trailer found")
     return None
 
+async def get_extended_tmdb_data(content_type: str, tmdb_id: int, client: httpx.AsyncClient) -> dict:
+    """Get extended TMDB data including cast, crew, rating, etc."""
+    
+    try:
+        if content_type == "movie":
+            url = f"https://api.themoviedb.org/3/movie/{tmdb_id}?api_key={TMDB_API_KEY}&append_to_response=credits,ratings"
+        else:
+            url = f"https://api.themoviedb.org/3/tv/{tmdb_id}?api_key={TMDB_API_KEY}&append_to_response=credits,ratings"
+        
+        resp = await client.get(url, timeout=10)
+        return resp.json() if resp.status_code == 200 else {}
+    except Exception as e:
+        logger.error(f"Error getting extended TMDB: {e}")
+        return {}
+
+def build_complete_metadata(item: dict, content_type: str, content_id: str) -> dict:
+    """Build complete metadata response from TMDB data"""
+    
+    meta = {
+        "id": content_id,
+        "type": content_type,
+    }
+    
+    # Basic fields
+    if content_type == "movie":
+        if item.get('title'):
+            meta["name"] = item['title']
+        if item.get('release_date'):
+            meta["releaseInfo"] = item['release_date'][:4]
+    else:
+        if item.get('name'):
+            meta["name"] = item['name']
+        if item.get('first_air_date'):
+            meta["releaseInfo"] = item['first_air_date'][:4]
+    
+    # Description
+    if item.get('overview'):
+        meta["description"] = item['overview']
+    
+    # Images
+    if item.get('poster_path'):
+        meta["poster"] = f"https://image.tmdb.org/t/p/w500{item['poster_path']}"
+    if item.get('backdrop_path'):
+        meta["background"] = f"https://image.tmdb.org/t/p/original{item['backdrop_path']}"
+    
+    # Rating/Vote
+    if item.get('vote_average'):
+        meta["imdbRating"] = item['vote_average']
+    
+    # Runtime
+    if item.get('runtime'):
+        meta["runtime"] = str(item['runtime'])
+    
+    # Genres
+    if item.get('genres'):
+        genre_names = [g.get('name', '') for g in item['genres'] if g.get('name')]
+        if genre_names:
+            meta["genres"] = genre_names
+    
+    # Cast
+    if item.get('credits', {}).get('cast'):
+        cast_list = []
+        for actor in item['credits']['cast'][:5]:  # Top 5 cast
+            if actor.get('name'):
+                cast_list.append(actor['name'])
+        if cast_list:
+            meta["cast"] = cast_list
+    
+    # Director/Creator
+    if content_type == "movie" and item.get('credits', {}).get('crew'):
+        directors = [c['name'] for c in item['credits']['crew'] if c.get('job') == 'Director']
+        if directors:
+            meta["director"] = directors
+    
+    # IMDb ID (if available)
+    if item.get('external_ids', {}).get('imdb_id'):
+        meta["imdbId"] = item['external_ids']['imdb_id']
+    
+    return meta
+
 @app.get("/meta/{content_type}/{content_id}.json")
-async def get_trailer_meta(
+async def get_complete_trailer_meta(
     content_type: str,
     content_id: str,
     lang1: str = Query(None),
     lang2: str = Query(None)
 ):
     """
-    GET ACCURATE TRAILER
+    COMPLETE METADATA + ACCURATE TRAILER
     
-    This addon MUST BE FIRST in your addon list to override aiometadata.
+    Returns full metadata including:
+    - Cast, Director, Writer
+    - Rating, IMDb score
+    - Genres, Runtime
+    - Poster, Background
+    - OUR accurate trailer (overrides aiometadata)
     
-    Strategy:
-    1. Get movie name from TMDB
-    2. Search for accurate trailer based on language preferences
-    3. Return COMPLETE metadata with our trailer
-    4. When placed FIRST, Stremio uses our trailer (not aiometadata's)
-    
-    If you place this addon AFTER aiometadata, it won't work because
-    Stremio stops requesting after first addon returns full response.
-    
-    ADDON ORDER MUST BE:
-    1. Nuvio Trailer Proxy (this)
-    2. aiometadata (or any other addon)
+    ADDON MUST BE FIRST in Nuvio addon list.
     """
     
     pref_lang1 = (lang1 or LANGUAGE_PREF_1).lower()
@@ -260,87 +326,81 @@ async def get_trailer_meta(
     logger.info(f"Languages: {pref_lang1} > {pref_lang2}")
     logger.info(f"{'='*50}")
     
-    # Get movie name and year from TMDB
-    movie_name = ""
-    year = ""
-    overview = ""
-    poster_path = ""
-    backdrop_path = ""
-    
+    # Get TMDB data
     try:
         async with httpx.AsyncClient() as client:
-            tmdb_resp = await client.get(
+            # First, find TMDB ID using external ID
+            find_resp = await client.get(
                 f"https://api.themoviedb.org/3/find/{content_id}?api_key={TMDB_API_KEY}&external_source=imdb_id",
                 timeout=10
             )
-            tmdb_data = tmdb_resp.json()
+            find_data = find_resp.json()
+            
+            if not find_data:
+                return {"meta": {"id": content_id, "type": content_type}}
+            
+            # Extract TMDB ID and basic data
+            tmdb_id = None
+            item = None
+            
+            if content_type == "movie":
+                results = find_data.get('movie_results', [])
+                if results:
+                    item = results[0]
+                    tmdb_id = item.get('id')
+            else:
+                results = find_data.get('tv_results', [])
+                if results:
+                    item = results[0]
+                    tmdb_id = item.get('id')
+            
+            if not item or not tmdb_id:
+                return {"meta": {"id": content_id, "type": content_type}}
+            
+            # Get extended data (cast, crew, etc)
+            extended_data = await get_extended_tmdb_data(content_type, tmdb_id, client)
+            
+            # Merge data
+            if extended_data:
+                item['credits'] = extended_data.get('credits', {})
+                if extended_data.get('external_ids'):
+                    item['external_ids'] = extended_data['external_ids']
+                if extended_data.get('genres'):
+                    item['genres'] = extended_data['genres']
+                if extended_data.get('vote_average'):
+                    item['vote_average'] = extended_data['vote_average']
+                if extended_data.get('runtime'):
+                    item['runtime'] = extended_data['runtime']
+    
     except Exception as e:
         logger.error(f"TMDB error: {e}")
         return {"meta": {"id": content_id, "type": content_type}}
     
-    # Extract metadata
-    if isinstance(tmdb_data, dict):
-        if content_type == "movie":
-            results = tmdb_data.get('movie_results', [])
-            if results:
-                item = results[0]
-                movie_name = item.get('title', '')
-                year = item.get('release_date', '')[:4]
-                overview = item.get('overview', '')
-                poster_path = item.get('poster_path', '')
-                backdrop_path = item.get('backdrop_path', '')
-        
-        elif content_type == "series":
-            results = tmdb_data.get('tv_results', [])
-            if results:
-                item = results[0]
-                movie_name = item.get('name', '')
-                year = item.get('first_air_date', '')[:4]
-                overview = item.get('overview', '')
-                poster_path = item.get('poster_path', '')
-                backdrop_path = item.get('backdrop_path', '')
+    # Get movie name for trailer search
+    movie_name = ""
+    if content_type == "movie":
+        movie_name = item.get('title', '')
+        year = item.get('release_date', '')[:4]
+    else:
+        movie_name = item.get('name', '')
+        year = item.get('first_air_date', '')[:4]
     
     if not movie_name:
-        logger.warning(f"Not found in TMDB")
-        response = {"meta": {"id": content_id, "type": content_type}}
-        trailer_cache[cache_key] = response
-        return response
+        return {"meta": {"id": content_id, "type": content_type}}
     
     # Get accurate trailer
-    video_id = await get_accurate_trailer(
-        movie_name,
-        year,
-        pref_lang1,
-        pref_lang2,
-        content_type
-    )
+    video_id = await get_accurate_trailer(movie_name, year, pref_lang1, pref_lang2, content_type)
     
-    # Return COMPLETE metadata with our accurate trailer
-    # This way, when placed FIRST, our trailer is used
-    meta_response = {
-        "meta": {
-            "id": content_id,
-            "type": content_type,
-            "name": movie_name,
-            "releaseInfo": year,
-        }
-    }
+    # Build complete metadata
+    meta_data = build_complete_metadata(item, content_type, content_id)
     
-    # Add optional fields
-    if overview:
-        meta_response["meta"]["description"] = overview
-    if poster_path:
-        meta_response["meta"]["poster"] = f"https://image.tmdb.org/t/p/w500{poster_path}"
-    if backdrop_path:
-        meta_response["meta"]["background"] = f"https://image.tmdb.org/t/p/original{backdrop_path}"
-    
-    # Add trailer (this is the key - our accurate trailer)
+    # Add our accurate trailer
     if video_id:
         logger.info(f"✅ Adding accurate trailer: {video_id}")
-        meta_response["meta"]["trailer"] = video_id
-        meta_response["meta"]["trailers"] = [{"source": video_id, "type": "Trailer"}]
-    else:
-        logger.info(f"⚠️ No trailer found")
+        meta_data['trailer'] = video_id
+        meta_data['trailers'] = [{"source": video_id, "type": "Trailer"}]
+    
+    meta_response = {"meta": meta_data}
     
     # Cache
     trailer_cache[cache_key] = meta_response
@@ -353,10 +413,16 @@ async def get_trailer_meta(
 async def health_check():
     return {
         "status": "healthy",
-        "version": "3.3.0",
-        "mode": "FULL OVERRIDE - MUST BE FIRST",
+        "version": "3.4.0",
+        "mode": "COMPLETE METADATA + ACCURATE TRAILER",
         "pref_1": LANGUAGE_PREF_1,
         "pref_2": LANGUAGE_PREF_2,
-        "IMPORTANT": "Place this addon FIRST in your Stremio addon list, BEFORE aiometadata",
-        "note": "Returns full metadata. Because it's FIRST, Stremio uses our trailer and stops here."
+        "features": [
+            "Cast, Director, Writer",
+            "IMDb rating",
+            "Genres, Runtime",
+            "Poster, Background",
+            "OUR accurate trailer"
+        ],
+        "IMPORTANT": "Place this addon FIRST in your Stremio addon list"
     }
