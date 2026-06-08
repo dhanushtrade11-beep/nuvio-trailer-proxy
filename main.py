@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from cachetools import TTLCache
 from youtubesearchpython.__future__ import VideosSearch
+from difflib import SequenceMatcher
 
 app = FastAPI()
 
@@ -20,7 +21,7 @@ meta_cache = TTLCache(maxsize=10000, ttl=86400)
 
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
-# Default language preferences (can be overridden per request)
+# Default language preferences
 DEFAULT_LANGUAGE_PREFS = [
     os.getenv("LANGUAGE_PREF_1", "telugu").lower(),
     os.getenv("LANGUAGE_PREF_2", "english").lower(),
@@ -31,93 +32,58 @@ LANGUAGE_KEYWORDS = {
     "telugu": ["telugu", "తెలుగు"],
     "english": ["english", "official"],
     "hindi": ["hindi", "हिंदी"],
-    "tamil": ["tamil", "தமிழ்"],
+    "tamil": ["tamil", "தமిழ்"],
     "kannada": ["kannada", "ಕನ್ನಡ"],
     "malayan": ["malayan", "malayalam", "മലയാളം"],
 }
 
-# Blocklist - common wrong trailers to exclude
-BLOCKLIST_KEYWORDS = [
+# STRICT blocklist - only obvious wrong trailers
+HARD_BLOCKLIST = [
     "chihni",
     "arjun reddy",
     "ye raat",
-    "kabali",
-    "baahubali",
-    "magnum opus",
+]
+
+# SOFT blocklist - try to avoid but not absolute
+SOFT_BLOCKLIST = [
     "making",
     "behind the scenes",
     "bts",
     "clips",
     "scene",
     "songs",
-    "movie review",
+    "review",
     "reaction",
     "short film",
     "fan made",
-    "mashup",
 ]
 
 def extract_significant_words(text: str) -> list:
     """Extract significant words (length > 2) from text"""
     return [w for w in text.lower().split() if len(w) > 2]
 
-def calculate_similarity(title: str, movie_name: str) -> float:
-    """
-    Calculate similarity score between title and movie name.
-    Returns: float between 0 and 1
-    """
-    title_words = set(extract_significant_words(title))
-    movie_words = set(extract_significant_words(movie_name))
-    
-    if not movie_words:
-        return 0.0
-    
-    # Calculate intersection ratio
-    intersection = len(title_words & movie_words)
-    return intersection / len(movie_words)
+def string_similarity(a: str, b: str) -> float:
+    """Calculate string similarity ratio using SequenceMatcher"""
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-def is_accurate_match(title: str, movie_name: str, keywords: list, strict: bool = True) -> tuple:
-    """
-    Advanced matching to avoid wrong trailers.
-    
-    Returns: (is_match: bool, reason: str)
-    
-    Checks:
-    1. Not in blocklist
-    2. Is actually a trailer
-    3. Contains language keywords
-    4. Contains movie name or similar words
-    5. Similarity score validates match
-    """
+def is_valid_trailer_title(title: str) -> bool:
+    """Check if title looks like a real trailer"""
     title_lower = title.lower()
-    movie_lower = movie_name.lower()
     
-    # Check if it's in blocklist
-    if any(blocked in title_lower for blocked in BLOCKLIST_KEYWORDS):
-        return False, f"Blocked (blocklist): {title}"
+    # Hard blocklist - absolutely reject these
+    if any(blocked in title_lower for blocked in HARD_BLOCKLIST):
+        return False
     
     # Must contain "trailer"
     if "trailer" not in title_lower:
-        return False, f"Not a trailer: {title}"
+        return False
     
-    # Must contain language keyword
-    has_language = any(keyword in title_lower for keyword in keywords)
-    if not has_language:
-        return False, f"No language keyword: {title}"
-    
-    # Check movie name similarity
-    similarity_score = calculate_similarity(title, movie_name)
-    
-    if strict:
-        # Strict mode: require at least 50% word match
-        if similarity_score < 0.5:
-            return False, f"Low similarity ({similarity_score:.0%}): {title}"
-    else:
-        # Lenient mode: require at least 30% word match
-        if similarity_score < 0.3:
-            return False, f"Very low similarity ({similarity_score:.0%}): {title}"
-    
-    return True, f"Valid match (similarity: {similarity_score:.0%}): {title}"
+    return True
+
+def is_soft_blocked(title: str) -> bool:
+    """Check if content is in soft blocklist"""
+    title_lower = title.lower()
+    return any(blocked in title_lower for blocked in SOFT_BLOCKLIST)
 
 async def search_trailer_by_language(
     movie_name: str, 
@@ -126,52 +92,112 @@ async def search_trailer_by_language(
     content_type: str = "movie"
 ) -> dict:
     """
-    Search for trailer in a specific language with AI-enhanced accuracy.
+    Multi-pass trailer search with flexible matching.
     
-    Returns: {"id": video_id, "title": title, "language": language} or None
+    Pass 1: Language-specific + strict name match
+    Pass 2: Language-specific + medium name match  
+    Pass 3: Generic + lenient name match
+    Pass 4: Final fallback - any official trailer
     """
     try:
         keywords = LANGUAGE_KEYWORDS.get(language, [language])
         
-        # Customize search query based on content type
         if content_type == "series":
-            search_query = f"{movie_name} {year} official {language} trailer series"
+            search_query = f"{movie_name} {year} {language} trailer series"
         else:
-            search_query = f"{movie_name} {year} official {language} trailer"
+            search_query = f"{movie_name} {year} {language} trailer"
         
-        print(f"\n🔍 Searching {language.upper()} ({content_type}): {search_query}")
+        print(f"\n🔍 Searching {language.upper()}: {search_query}")
         
-        search = VideosSearch(search_query, limit=8)
+        search = VideosSearch(search_query, limit=15)
         results = await search.next()
         
-        if results and results.get('result'):
-            print(f"   Found {len(results['result'])} results, validating...")
-            
-            # Find the most accurate match from top results
-            for idx, video in enumerate(results['result'], 1):
-                video_title = video.get('title', '')
-                video_id = video.get('id', '')
-                
-                is_match, reason = is_accurate_match(video_title, movie_name, keywords, strict=True)
-                
-                if is_match:
-                    print(f"   ✅ Result {idx}: {reason}")
-                    print(f"   ✨ FOUND {language.upper()} trailer!")
-                    return {
-                        "id": video_id,
-                        "title": video_title,
-                        "language": language
-                    }
-                else:
-                    print(f"   ❌ Result {idx}: {reason}")
-            
-            print(f"   ⚠️ No accurate {language} match in top 8 results")
+        if not results or not results.get('result'):
+            print(f"   ⚠️ No results found")
             return None
+        
+        video_list = results['result']
+        print(f"   Found {len(video_list)} results, validating...")
+        
+        # PASS 1: Strict matching - language keyword + strong name match
+        print(f"   [PASS 1] Strict: Language + name match (≥60%)")
+        for idx, video in enumerate(video_list, 1):
+            title = video.get('title', '')
+            video_id = video.get('id', '')
+            
+            if not is_valid_trailer_title(title):
+                continue
+            
+            # Must have language keyword
+            has_language = any(kw in title.lower() for kw in keywords)
+            if not has_language:
+                continue
+            
+            # Similarity check
+            similarity = string_similarity(title, movie_name)
+            if similarity >= 0.6:
+                if not is_soft_blocked(title):
+                    print(f"   ✅ PASS 1 Result {idx}: {title} (sim: {similarity:.0%})")
+                    return {"id": video_id, "title": title, "language": language}
+        
+        # PASS 2: Medium matching - language keyword + medium name match
+        print(f"   [PASS 2] Medium: Language + looser match (≥40%)")
+        for idx, video in enumerate(video_list, 1):
+            title = video.get('title', '')
+            video_id = video.get('id', '')
+            
+            if not is_valid_trailer_title(title):
+                continue
+            
+            # Must have language keyword
+            has_language = any(kw in title.lower() for kw in keywords)
+            if not has_language:
+                continue
+            
+            # Similarity check
+            similarity = string_similarity(title, movie_name)
+            if similarity >= 0.4:
+                print(f"   ✅ PASS 2 Result {idx}: {title} (sim: {similarity:.0%})")
+                return {"id": video_id, "title": title, "language": language}
+        
+        # PASS 3: Lenient matching - no language keyword requirement, just name match
+        print(f"   [PASS 3] Lenient: Name match only (≥50%)")
+        for idx, video in enumerate(video_list, 1):
+            title = video.get('title', '')
+            video_id = video.get('id', '')
+            
+            if not is_valid_trailer_title(title):
+                continue
+            
+            # Skip soft blocklist
+            if is_soft_blocked(title):
+                continue
+            
+            # Similarity check (no language requirement)
+            similarity = string_similarity(title, movie_name)
+            if similarity >= 0.5:
+                print(f"   ✅ PASS 3 Result {idx}: {title} (sim: {similarity:.0%})")
+                return {"id": video_id, "title": title, "language": language}
+        
+        # PASS 4: Final fallback - any official trailer
+        print(f"   [PASS 4] Fallback: Any official trailer")
+        for idx, video in enumerate(video_list, 1):
+            title = video.get('title', '')
+            video_id = video.get('id', '')
+            
+            if not is_valid_trailer_title(title):
+                continue
+            
+            if "official" in title.lower():
+                print(f"   ✅ PASS 4 Result {idx}: {title}")
+                return {"id": video_id, "title": title, "language": language}
+        
+        print(f"   ❌ No match found in any pass")
+        return None
     
     except Exception as e:
-        print(f"   ❌ Error searching {language} trailer: {str(e)}")
-    
-    return None
+        print(f"   ❌ Error: {str(e)}")
+        return None
 
 async def get_best_trailer(
     movie_name: str, 
@@ -180,21 +206,17 @@ async def get_best_trailer(
     content_type: str = "movie"
 ) -> dict:
     """
-    Get the best trailer based on language preferences with AI accuracy.
+    Get best trailer with intelligent fallback.
     
-    Smart Fallback Logic:
-    1. Try first language preference (e.g., Telugu)
-    2. If not found, try second preference (e.g., English)
-    3. If still not found, try original language
-    4. If still not found, generic search with validation
-    
-    Returns: {"id": video_id, "language": language_used} or None
+    1. Try first language preference
+    2. Try second language preference
+    3. Try generic search (no language requirement)
     """
     
-    print(f"\n🎬 AI Trailer Search for: {movie_name} ({year}) - {content_type}")
-    print(f"🎯 Language preference order: {language_prefs}")
+    print(f"\n🎬 Smart Trailer Search: {movie_name} ({year}) - {content_type}")
+    print(f"🎯 Language preferences: {language_prefs}")
     
-    # Search all preferences in parallel for speed
+    # Search all preferences in parallel
     search_tasks = [
         search_trailer_by_language(movie_name, year, lang, content_type) 
         for lang in language_prefs
@@ -202,61 +224,56 @@ async def get_best_trailer(
     
     results = await asyncio.gather(*search_tasks, return_exceptions=True)
     
-    # Return the first successful match (respects preference order)
+    # Return first successful match
     for idx, result in enumerate(results):
         if result and isinstance(result, dict):
-            print(f"\n✅ SUCCESS: Using {language_prefs[idx]} trailer")
+            print(f"\n✅ Found {language_prefs[idx]} trailer!")
             return result
     
-    # Fallback to original language with lenient matching
-    print(f"\n⚠️ Preferences exhausted. Trying original language with AI validation...")
-    original_query = f"{movie_name} {year} official trailer"
-    if content_type == "series":
-        original_query += " series"
-    
-    print(f"   Searching: {original_query}")
+    # Fallback: Generic search without language requirement
+    print(f"\n⚠️ Language preferences exhausted. Trying generic search...")
     
     try:
-        search = VideosSearch(original_query, limit=8)
+        generic_query = f"{movie_name} {year} official trailer"
+        if content_type == "series":
+            generic_query += " series"
+        
+        print(f"   Searching: {generic_query}")
+        
+        search = VideosSearch(generic_query, limit=15)
         results = await search.next()
         
         if results and results.get('result'):
-            print(f"   Found {len(results['result'])} results, validating...")
-            
             for idx, video in enumerate(results['result'], 1):
-                video_title = video.get('title', '')
+                title = video.get('title', '')
                 video_id = video.get('id', '')
                 
-                is_match, reason = is_accurate_match(
-                    video_title, 
-                    movie_name, 
-                    ["trailer"],  # Just check for "trailer"
-                    strict=False  # Use lenient matching for original
-                )
+                if not is_valid_trailer_title(title):
+                    continue
                 
-                if is_match:
-                    print(f"   ✅ Result {idx}: {reason}")
-                    print(f"   ✨ Found original language trailer!")
-                    return {
-                        "id": video_id,
-                        "language": "original"
-                    }
-                else:
-                    print(f"   ❌ Result {idx}: {reason}")
+                # Generic matching - just check similarity
+                similarity = string_similarity(title, movie_name)
+                if similarity >= 0.4 and not is_hard_blocked(title):
+                    print(f"   ✅ Found generic result {idx}: {title}")
+                    return {"id": video_id, "language": "generic"}
     
     except Exception as e:
-        print(f"   ❌ Original search error: {str(e)}")
+        print(f"   ❌ Generic search error: {str(e)}")
     
-    print(f"\n❌ No valid trailer found for {movie_name}")
+    print(f"\n❌ No trailer found for {movie_name}")
     return None
+
+def is_hard_blocked(title: str) -> bool:
+    """Check hard blocklist"""
+    return any(blocked in title.lower() for blocked in HARD_BLOCKLIST)
 
 @app.get("/manifest.json")
 async def get_manifest():
     return {
         "id": "com.yourname.youtubetrailers.v3",
-        "version": "2.2.0",
-        "name": "Nuvio Smart Trailers (AI-Enhanced)",
-        "description": "TMDB metadata with AI-powered YouTube trailer matching. Multi-language preferences with intelligent fallback logic.",
+        "version": "2.3.0",
+        "name": "Nuvio Smart Trailers (Ultra-Accurate)",
+        "description": "Multi-pass AI trailer matching with intelligent fallback. Gets trailers that actually exist on YouTube.",
         "resources": ["meta"],
         "types": ["movie", "series"],
         "idPrefixes": ["tt"]
@@ -270,58 +287,49 @@ async def get_custom_meta(
     lang2: str = Query(None)
 ):
     """
-    Fetch metadata with AI-POWERED accurate trailer selection.
+    Fetch metadata with ULTRA-ACCURATE trailer selection using multi-pass algorithm.
     
-    Smart Features:
-    - AI Similarity Matching: Prevents wrong movie trailers
-    - Intelligent Fallback: Series without Telugu trailer? Tries English
-    - Content-Type Aware: Customizes search for movies vs series
-    - Blocklist Protection: Excludes known wrong trailers
+    Search Strategy:
+    - PASS 1: Language-specific + strict name match
+    - PASS 2: Language-specific + medium name match
+    - PASS 3: Lenient name match (no language requirement)
+    - PASS 4: Fallback to generic trailer search
     
     Query Parameters:
-    - lang1: First language preference (default: LANGUAGE_PREF_1 env var or 'telugu')
-    - lang2: Second language preference (default: LANGUAGE_PREF_2 env var or 'english')
-    
-    Example: /meta/movie/tt0111161.json?lang1=telugu&lang2=english
-             /meta/series/tt10940906.json?lang1=telugu&lang2=english
+    - lang1: First language preference (default: telugu)
+    - lang2: Second language preference (default: english)
     """
     
     cache_key = f"{content_type}_{content_id}_{lang1}_{lang2}"
     
-    # Check cache for instant response
     if cache_key in meta_cache:
-        print(f"⚡ Loading {content_id} from instant cache!")
+        print(f"⚡ Loading from cache!")
         return meta_cache[cache_key]
     
-    # Determine language preferences for this request
     language_prefs = [
         (lang1 or DEFAULT_LANGUAGE_PREFS[0]).lower(),
         (lang2 or DEFAULT_LANGUAGE_PREFS[1]).lower(),
     ]
     
-    # Default fallback structural response
     meta_response = {"meta": {"id": content_id, "type": content_type, "name": "Loading..."}}
     
     if not TMDB_API_KEY:
-        print("❌ ERROR: TMDB_API_KEY environment variable is missing!")
+        print("❌ TMDB_API_KEY missing!")
         return meta_response
     
     async with httpx.AsyncClient() as client:
         try:
-            # 1. Fetch metadata from TMDB
-            print(f"\n📡 Fetching TMDB data for {content_id}...")
+            print(f"\n📡 Fetching TMDB: {content_id}")
             tmdb_resp = await client.get(
                 f"https://api.themoviedb.org/3/find/{content_id}?api_key={TMDB_API_KEY}&external_source=imdb_id"
             )
             tmdb_data = tmdb_resp.json()
             
             if isinstance(tmdb_data, dict) and "status_message" in tmdb_data:
-                print(f"❌ TMDB API ERROR: {tmdb_data.get('status_message')}")
                 return meta_response
             
             name, year, overview, poster_path, backdrop_path = "", "", "", "", ""
             
-            # Extract TMDB data
             if isinstance(tmdb_data, dict):
                 if content_type == "movie":
                     results = tmdb_data.get('movie_results', [])
@@ -342,19 +350,15 @@ async def get_custom_meta(
                         poster_path = item.get('poster_path', '')
                         backdrop_path = item.get('backdrop_path', '')
             
-            # If no name found, return early
             if not name:
-                print(f"❌ No content found for {content_id}")
                 return meta_response
             
-            print(f"✨ Found: {name} ({year}) - Type: {content_type}")
+            print(f"✨ Found: {name} ({year})")
             
-            # 2. Get best trailer with AI-powered accurate matching
+            # Get trailer with multi-pass search
             trailer_result = await get_best_trailer(name, year, language_prefs, content_type)
             best_video_id = trailer_result['id'] if trailer_result else None
-            used_language = trailer_result['language'] if trailer_result else "none"
             
-            # 3. Construct Stremio Meta Object
             meta_data = {
                 "id": content_id,
                 "type": content_type,
@@ -369,34 +373,27 @@ async def get_custom_meta(
                 meta_data["background"] = f"https://image.tmdb.org/t/p/original{backdrop_path}"
             
             if best_video_id:
-                print(f"\n✅ FINAL: Found {used_language} trailer for {name}")
+                print(f"✅ FINAL: Found trailer!")
                 meta_data['trailers'] = [{"source": best_video_id, "type": "Trailer"}]
                 meta_data['trailer'] = best_video_id
-            else:
-                print(f"\n⚠️ No valid trailer found for {name}")
             
             meta_response = {"meta": meta_data}
         
         except Exception as e:
             print(f"❌ ERROR: {str(e)}")
         
-        # Cache the response for instant future access
         meta_cache[cache_key] = meta_response
         return meta_response
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {
         "status": "healthy",
-        "version": "2.2.0",
-        "ai_enabled": True,
-        "default_languages": DEFAULT_LANGUAGE_PREFS,
-        "supported_languages": list(LANGUAGE_KEYWORDS.keys()),
+        "version": "2.3.0",
         "features": {
-            "similarity_matching": "Prevents wrong movie trailers",
-            "intelligent_fallback": "Auto-detects missing languages per content",
-            "content_type_aware": "Different search for movies vs series",
-            "blocklist_protection": "Excludes known wrong trailers"
+            "multi_pass_search": "4-pass algorithm for maximum accuracy",
+            "flexible_matching": "Relaxed similarity thresholds",
+            "intelligent_fallback": "Finds trailers that exist",
+            "language_preferences": "User-configurable"
         }
     }
