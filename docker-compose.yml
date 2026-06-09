@@ -1,0 +1,84 @@
+version: "3.8"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Full stack: aiometadata + nuvio-trailer-proxy + Redis
+#
+# Place nuvio-trailer-proxy/ folder next to this docker-compose.yml
+# (copy the Dockerfile + main.py + requirements.txt there).
+#
+# Set all required values in .env before running:
+#   docker compose up -d --build
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── aiometadata ────────────────────────────────────────────────────────────
+  aiometadata:
+    image: ghcr.io/cedya77/aiometadata:latest   # or your fork's built image
+    container_name: aiometadata
+    restart: unless-stopped
+    ports:
+      - "3232:3232"
+    env_file:
+      - .env
+    environment:
+      # ── Existing aiometadata env vars (keep yours) ──
+      - PORT=3232
+      - REDIS_URL=redis://aiometadata_redis:6379
+
+      # ── NEW: nuvio-trailer-proxy integration ────────
+      # URL of the proxy sidecar (internal Docker network)
+      - TRAILER_PROXY_URL=http://nuvio_trailer_proxy:8000
+      # Language preferences forwarded to the proxy
+      - TRAILER_LANG_1=${TRAILER_LANG_1:-telugu}
+      - TRAILER_LANG_2=${TRAILER_LANG_2:-english}
+
+    depends_on:
+      aiometadata_redis:
+        condition: service_healthy
+      nuvio_trailer_proxy:
+        condition: service_healthy
+    volumes:
+      - ${DOCKER_DATA_DIR:-./data}/aiometadata:/app/addon/data
+
+  # ── nuvio-trailer-proxy ────────────────────────────────────────────────────
+  nuvio_trailer_proxy:
+    build:
+      context: ./nuvio-trailer-proxy   # folder with Dockerfile + main.py
+      dockerfile: Dockerfile
+    container_name: nuvio_trailer_proxy
+    restart: unless-stopped
+    # NOT exposed externally — only aiometadata talks to it internally
+    expose:
+      - "8000"
+    environment:
+      # TMDB key: reuse the same one from aiometadata's env
+      - TMDB_API_KEY=${TMDB_API}
+      # Gemini key: for AI-powered query generation
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      # YouTube Data API v3 key (optional — proxy falls back to scraper without it)
+      - YOUTUBE_API_KEY=${YOUTUBE_API_KEY}
+      # Language preferences (same as aiometadata's TRAILER_LANG_*)
+      - LANGUAGE_PREF_1=${TRAILER_LANG_1:-telugu}
+      - LANGUAGE_PREF_2=${TRAILER_LANG_2:-english}
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ── Redis (unchanged) ──────────────────────────────────────────────────────
+  aiometadata_redis:
+    image: redis:latest
+    container_name: aiometadata_redis
+    restart: unless-stopped
+    volumes:
+      - ${DOCKER_DATA_DIR:-./data}/redis:/data
+    command: redis-server --appendonly yes --save 3600 1
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
